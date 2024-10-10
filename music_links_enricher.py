@@ -325,9 +325,17 @@ def get_deezer_link(artist, album, possible_songs):
         logging.info(f"Searching for album '{album_name}' by artist '{artist_name}' on Deezer.")
         response = requests.get(f"{DEEZER_API_URL}search/album?q=artist:'{artist_name}' album:'{album_name}'")
         rate_limit()
-        if response.status_code == 200:
+
+        # Log the status code and response for debugging
+        if response.status_code != 200:
+            logging.error(f"Deezer API request failed with status {response.status_code}: {response.text}")
+            return None
+
+        try:
             return response.json()
-        return None
+        except json.JSONDecodeError:
+            logging.error(f"Failed to parse Deezer API response: {response.text}")
+            return None
 
     artist_list = artist.split("&")
 
@@ -335,7 +343,7 @@ def get_deezer_link(artist, album, possible_songs):
         artist_name = artist_name.strip()
         data = search_deezer_for_artist(artist_name, album)
 
-        if data and data['data']:
+        if data and 'data' in data:
             # Sort results by release date (newest first)
             sorted_data = sorted(data['data'], key=lambda x: x.get('release_date', ''), reverse=True)
 
@@ -353,6 +361,9 @@ def get_deezer_link(artist, album, possible_songs):
                             deezer_tracks.append(track['title'])
                     logging.info(f"Found Deezer album link for '{artist_name}' - '{album}': {album_data['link']}")
                     return album_data['link'], deezer_tracks
+        else:
+            # Log the response data for debugging if it's missing the expected fields
+            logging.error(f"Deezer response missing 'data' field for artist '{artist}' and album '{album}': {data}")
 
     # If no exact match, attempt a broader search based on album name only
     logging.info(f"No exact match for album '{album}'. Trying album name only on Deezer.")
@@ -360,8 +371,13 @@ def get_deezer_link(artist, album, possible_songs):
     rate_limit()
 
     if response.status_code == 200:
-        data = response.json()
-        if data['data']:
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            logging.error(f"Failed to parse Deezer API response: {response.text}")
+            return None, deezer_tracks
+
+        if 'data' in data:
             # Sort results by release date (newest first)
             sorted_data = sorted(data['data'], key=lambda x: x.get('release_date', ''), reverse=True)
 
@@ -380,6 +396,8 @@ def get_deezer_link(artist, album, possible_songs):
                                 deezer_tracks.append(track['title'])
                         logging.info(f"Found Deezer album link for '{artist_name}' - '{album}': {album_data['link']}")
                         return album_data['link'], deezer_tracks
+        else:
+            logging.error(f"Deezer response missing 'data' field for album '{album}': {data}")
 
     # Fallback: Search for artist page if no album or track is found
     for artist_name in artist_list:
@@ -391,7 +409,7 @@ def get_deezer_link(artist, album, possible_songs):
 
             if response.status_code == 200:
                 data = response.json()
-                if data['data']:
+                if 'data' in data and data['data']:
                     logging.info(f"Found Deezer artist page link for '{artist_name}': {data['data'][0]['link']}")
                     return data['data'][0]['link'], deezer_tracks
         except Exception as e:
