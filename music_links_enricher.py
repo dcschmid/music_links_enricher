@@ -6,6 +6,7 @@ import logging
 import base64
 import time
 from fuzzywuzzy import fuzz
+import jwt
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,200 +17,296 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 DEEZER_API_URL = "https://api.deezer.com/"
 DISCOGS_API_TOKEN = os.getenv("DISCOGS_API_TOKEN")
 MUSICBRAINZ_API_URL = "https://musicbrainz.org/ws/2/"
+APPLE_MUSIC_KEY_ID = os.getenv("APPLE_MUSIC_KEY_ID")
+APPLE_MUSIC_TEAM_ID = os.getenv("APPLE_MUSIC_TEAM_ID")
+APPLE_MUSIC_PRIVATE_KEY_PATH = os.getenv("APPLE_MUSIC_PRIVATE_KEY_PATH")
+
+# Common title variants to improve search results
+TITLE_VARIANTS = [
+    "Deluxe", "Remastered", "Anniversary", "Special Edition", "Expanded Edition", "Live",
+    "Reissue", "Bonus Tracks", "Limited Edition", "Original", "Collector's Edition"
+]
+ALBUM_TYPES = ["album", "ep", "compilation", "live"]
 
 def rate_limit(delay: float = 2.0) -> None:
-    """
-    Introduce a delay before executing the next function call to avoid hitting the rate limit for various APIs.
-
-    Args:
-        delay (float, optional): The duration of the delay in seconds. Defaults to 2.0.
-
-    Returns:
-        None
-    """
+    """Introduce a delay before executing the next function call to avoid hitting the rate limit for various APIs."""
     time.sleep(delay)
 
 def clean_artist_name(artist: str) -> str:
-    """
-    Clean the artist's name by removing any text after a question mark or other unwanted characters.
-
-    Args:
-        artist (str): The artist's name that needs to be cleaned.
-
-    Returns:
-        str: The cleaned artist name.
-    """
-    # Split the string at the first question mark and return the first part
-    # Remove leading and trailing whitespace
+    """Clean the artist's name by removing any text after a question mark or other unwanted characters."""
     return artist.split('?')[0].strip()
 
 def fuzzy_match(target, candidate, threshold=85):
-    """
-    Compares the target string against the candidate string and returns True if the fuzzy
-    match ratio between the two strings exceeds the specified threshold.
-
-    Ensures that the target is contained within the candidate to avoid false positives.
-
-    Args:
-        target (str): The target string to compare against the candidate.
-        candidate (str): The candidate string to compare against the target.
-        threshold (int, optional): The minimum fuzzy match ratio required to return True.
-            Defaults to 85.
-
-    Returns:
-        bool: True if the fuzzy match ratio between target and candidate exceeds the threshold,
-            and the target is contained within the candidate.
-    """
+    """Compares the target string against the candidate string and returns True if the fuzzy match ratio between the two strings exceeds the specified threshold."""
     return fuzz.token_sort_ratio(target, candidate) >= threshold or target.lower() in candidate.lower()
 
 def authenticate_spotify() -> str | None:
-    """
-    Authenticate with Spotify using client ID and secret.
-
-    Returns:
-        str | None: An access token if authentication is successful, None otherwise.
-    """
-    # Encode client ID and secret as base64
+    """Authenticate with Spotify using client ID and secret."""
     auth_url = "https://accounts.spotify.com/api/token"
     auth_header = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
-    # Create the headers with the base64 encoded client ID and secret
     headers = {"Authorization": f"Basic {auth_header}"}
-    # Create the data with the grant type
     data = {"grant_type": "client_credentials"}
-    # Post the request to the Spotify API to obtain an access token
     response = requests.post(auth_url, headers=headers, data=data)
-    # If the request is successful, return the access token
     if response.status_code == 200:
         return response.json().get("access_token")
-    # If the request fails, log an error and return None
     logging.error(f"Spotify authentication failed: {response.status_code} - {response.text}")
     return None
 
-def get_spotify_album_preview(spotify_token, album_id):
-    """
-    Fetch the preview URL for tracks from a specific Spotify album using the album's ID.
+def authenticate_apple_music() -> str:
+    """Generate a JWT for Apple Music API authentication."""
+    with open(APPLE_MUSIC_PRIVATE_KEY_PATH, 'r') as f:
+        private_key = f.read()
 
-    :param spotify_token: The Spotify OAuth token
-    :param album_id: The unique ID of the album to search for
-    :return: Preview URL if found, otherwise None
-    """
-    # Set up the endpoint URL and parameters
-    url = f"https://api.spotify.com/v1/albums/{album_id}/tracks"
-    headers = {
-        "Authorization": f"Bearer {spotify_token}",  # Include the OAuth token
-        "Content-Type": "application/json"  # Set the content type to JSON
-    }
-    params = {
-        "market": "DE"  # Set the market to Germany
-    }
+    headers = {'alg': 'ES256', 'kid': APPLE_MUSIC_KEY_ID}
+    payload = {'iss': APPLE_MUSIC_TEAM_ID, 'iat': int(time.time()), 'exp': int(time.time()) + 3600}
 
-    # Make the request to the API
+    token = jwt.encode(payload, private_key, algorithm='ES256', headers=headers)
+
+    return token.decode('utf-8') if isinstance(token, bytes) else token
+
+def get_apple_music_preview(artist, album, possible_songs, token):
+    """Search for an album or song preview URL on Apple Music with album variants."""
+    url = f"https://api.music.apple.com/v1/catalog/de/search"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Try album preview using variants
+    for variant in [album] + [f"{album} {suffix}" for suffix in TITLE_VARIANTS]:
+        params = {'term': f'{artist} {variant}', 'types': 'albums', 'limit': 1}
+        response = requests.get(url, headers=headers, params=params)
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if 'albums' in data['results'] and data['results']['albums']['data']:
+                album_data = data['results']['albums']['data'][0]
+                album_id = album_data['id']
+
+                # Fetch album tracks to get previews
+                album_tracks_response = requests.get(f"https://api.music.apple.com/v1/catalog/de/albums/{album_id}/tracks", headers=headers)
+                if album_tracks_response.status_code == 200:
+                    album_tracks_data = album_tracks_response.json()
+                    for track in album_tracks_data['data']:
+                        if 'previews' in track['attributes'] and track['attributes']['previews']:
+                            preview_url = track['attributes']['previews'][0]['url']
+                            logging.info(f"Found Apple Music album preview for track: {track['attributes']['name']} - {preview_url}")
+                            return preview_url
+
+    # If no album preview, try to get a song preview
+    for song in possible_songs:
+        params = {'term': f'{artist} {song}', 'types': 'songs', 'limit': 1}
+        response = requests.get(url, headers=headers, params=params)
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if 'songs' in data['results'] and data['results']['songs']['data']:
+                song_data = data['results']['songs']['data'][0]
+                if 'previews' in song_data['attributes'] and song_data['attributes']['previews']:
+                    preview_url = song_data['attributes']['previews'][0]['url']
+                    logging.info(f"Found Apple Music song preview: {song_data['attributes']['name']} - {preview_url}")
+                    return preview_url
+
+    logging.info("No Apple Music preview found.")
+    return None
+
+
+def get_deezer_preview(artist, album, possible_songs):
+    """Search for an album or song preview URL on Deezer."""
+    deezer_tracks = []
+
+    # Deezer API URL
+    DEEZER_API_URL = "https://api.deezer.com"
+
+    # Search for album using variants
+    for variant in [album] + [f"{album} {suffix}" for suffix in TITLE_VARIANTS]:
+        response = requests.get(f"{DEEZER_API_URL}/search/album?q=artist:'{artist}' album:'{variant}'")
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if 'data' in data and data['data']:
+                album_data = data['data'][0]  # Take the first matching album
+                album_id = album_data['id']
+
+                # Get the album's tracklist to find previews
+                album_tracks_response = requests.get(f"{DEEZER_API_URL}/album/{album_id}/tracks")
+                if album_tracks_response.status_code == 200:
+                    album_tracks_data = album_tracks_response.json()
+                    for track in album_tracks_data['data']:
+                        if 'preview' in track and track['preview']:
+                            logging.info(f"Found Deezer album preview for track: {track['title']} - {track['preview']}")
+                            return track['preview']
+
+    # If no album preview found, search for individual tracks
+    for song in possible_songs:
+        response = requests.get(f"{DEEZER_API_URL}/search/track?q=artist:'{artist}' track:'{song}'")
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if 'data' in data and data['data']:
+                track_data = data['data'][0]  # Take the first matching track
+                if 'preview' in track_data and track_data['preview']:
+                    logging.info(f"Found Deezer song preview: {track_data['title']} - {track_data['preview']}")
+                    return track_data['preview']
+
+    logging.info("No Deezer preview found.")
+    return None
+
+
+def get_spotify_preview(artist, album, possible_songs, spotify_token):
+    """Search for an album or song preview URL on Spotify."""
+    headers = {"Authorization": f"Bearer {spotify_token}"}
+    search_url = "https://api.spotify.com/v1/search"
+    spotify_tracks = []
+
+    # Search for album using variants
+    for variant in [album] + [f"{album} {suffix}" for suffix in TITLE_VARIANTS]:
+        params = {"q": f"album:{variant} artist:{artist}", "type": "album", "limit": 1}
+        response = requests.get(search_url, headers=headers, params=params)
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if data['albums']['items']:
+                album_id = data['albums']['items'][0]['id']
+                album_tracks_response = requests.get(f"https://api.spotify.com/v1/albums/{album_id}/tracks", headers=headers)
+
+                if album_tracks_response.status_code == 200:
+                    album_tracks_data = album_tracks_response.json()
+                    for track in album_tracks_data['items']:
+                        if 'preview_url' in track and track['preview_url']:
+                            logging.info(f"Found Spotify album preview for track: {track['name']} - {track['preview_url']}")
+                            return track['preview_url']  # Return the first available preview
+
+    # If no album preview found, search for individual tracks
+    for song in possible_songs:
+        params = {"q": f"track:{song} artist:{artist}", "type": "track", "limit": 1}
+        response = requests.get(search_url, headers=headers, params=params)
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if data['tracks']['items']:
+                track = data['tracks']['items'][0]
+                if 'preview_url' in track and track['preview_url']:
+                    logging.info(f"Found Spotify song preview: {track['name']} - {track['preview_url']}")
+                    return track['preview_url']
+
+    logging.info("No Spotify preview found.")
+    return None
+
+
+def get_music_preview_link(artist, album, possible_songs, apple_music_token, spotify_token):
+    """Get music preview from Apple Music, Deezer, or Spotify, in that order."""
+    # Try Apple Music (album, song, artist)
+    preview_url = get_apple_music_preview(artist, album, possible_songs, apple_music_token)
+    if preview_url:
+        return preview_url
+
+    # Try Deezer (album, song, artist)
+    preview_url = get_deezer_preview(artist, album, possible_songs)
+    if preview_url:
+        return preview_url
+
+    # Try Spotify (album, song, artist)
+    preview_url = get_spotify_preview(artist, album, possible_songs, spotify_token)
+    if preview_url:
+        return preview_url
+
+    logging.info("No preview link found on Apple Music, Deezer, or Spotify.")
+    return None
+
+def get_apple_music_link(artist, album, possible_songs, token):
+    """Search for an album, track, or artist on Apple Music and return the link."""
+    url = f"https://api.music.apple.com/v1/catalog/de/search"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Search for album using variants
+    for variant in [album] + [f"{album} {suffix}" for suffix in TITLE_VARIANTS]:
+        params = {'term': f'{artist} {variant}', 'types': 'albums', 'limit': 1}
+        response = requests.get(url, headers=headers, params=params)
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if 'albums' in data['results'] and data['results']['albums']['data']:
+                album_data = data['results']['albums']['data'][0]
+                album_url = album_data['attributes']['url']
+                album_name = album_data['attributes']['name']
+                artist_name = album_data['attributes']['artistName']
+                logging.info(f"Found Apple Music album: {album_name} by {artist_name} - {album_url}")
+                return album_url
+
+    # If no album found, search for individual tracks from possible_songs
+    for song in possible_songs:
+        params = {'term': f'{artist} {song}', 'types': 'songs', 'limit': 1}
+        response = requests.get(url, headers=headers, params=params)
+        rate_limit()
+
+        if response.status_code == 200:
+            data = response.json()
+            if 'songs' in data['results'] and data['results']['songs']['data']:
+                song_data = data['results']['songs']['data'][0]
+                song_url = song_data['attributes']['url']
+                song_name = song_data['attributes']['name']
+                logging.info(f"Found Apple Music song: {song_name} by {artist} - {song_url}")
+                return song_url
+
+    # If no album or track found, fallback to artist page
+    params = {'term': f'{artist}', 'types': 'artists', 'limit': 1}
     response = requests.get(url, headers=headers, params=params)
-
-    # Check if the request was successful
-    if response.status_code == 200:
-        data = response.json()
-
-        # Loop through the tracks in the album to find the preview URL
-        for track in data['items']:  # Iterate over the tracks in the album
-            if track.get('preview_url'):  # Check if the track has a preview URL
-                logging.info(f"Found Spotify album track preview for album '{album_id}': {track['preview_url']}")
-                return track['preview_url']  # Return the preview URL
-    else:
-        logging.error(f"Failed to fetch tracks from Spotify album with ID '{album_id}'. Status code: {response.status_code}")
-
-    return None  # Return None if no preview URL is found
-
-def search_musicbrainz_for_album(artist, album):
-    """
-    Search MusicBrainz for an album using the artist and album name.
-
-    Args:
-        artist (str): The artist name.
-        album (str): The album name.
-
-    Returns:
-        list: A list of track names found in MusicBrainz.
-    """
-    # Construct the URL and parameters for the search request
-    url = f"{MUSICBRAINZ_API_URL}recording/"
-    params = {'query': f'artist:"{artist}" AND release:"{album}"', 'fmt': 'json', 'limit': 10}
-    # Set the User-Agent header to identify the application
-    headers = {'User-Agent': 'MusicTriviaApp/1.0 (example@example.com)'}
-    # Send the request to MusicBrainz
-    response = requests.get(url, headers=headers, params=params)
-    # Rate limit the requests to avoid hitting the limits
     rate_limit()
 
     if response.status_code == 200:
-        # Parse the JSON response
         data = response.json()
-        # If the response contains recordings, extract the track titles
-        if data.get('recordings'):
-            tracks = [recording['title'] for recording in data['recordings']]
-            return tracks
-    # Log an info message if no matches were found
-    logging.info(f"No matches found in MusicBrainz for {album} by {artist}")
-    # Return an empty list if no matches were found
-    return []
+        if 'artists' in data['results'] and data['results']['artists']['data']:
+            artist_data = data['results']['artists']['data'][0]
+            artist_url = artist_data['attributes']['url']
+            logging.info(f"Found Apple Music artist: {artist} - {artist_url}")
+            return artist_url
 
-def get_discogs_album_tracks(artist, album):
-    """
-    Fetch album tracklist from Discogs.
-
-    This function searches for an album in Discogs using the artist and album name,
-    and returns the tracklist of the first result.
-
-    Args:
-        artist (str): The artist name.
-        album (str): The album name.
-
-    Returns:
-        list: The tracklist of the album.
-    """
-    discogs_api = discogs_client.Client('MusicTriviaApp', user_token=DISCOGS_API_TOKEN)
-    try:
-        # Clean the artist name
-        artist = clean_artist_name(artist)
-        # Search for the album in Discogs
-        results = discogs_api.search(album, artist=artist, type='release')
-        # Rate limit the requests to avoid hitting the limits
-        rate_limit()
-        # If there are results, get the first one and extract the tracklist
-        if results.count > 0:
-            release = results[0]
-            tracklist = [track.title for track in release.tracklist]
-
-            return tracklist
-    except Exception as e:
-        # Log an error if something goes wrong
-        logging.error(f"Error fetching Discogs data: {e}")
-    # Log an info message if no matches were found
-    logging.info(f"No matches found in Discogs for {album} by {artist}")
-    # Return an empty list if no matches were found
-    return []
+    logging.error(f"Failed to fetch from Apple Music. Status code: {response.status_code}")
+    return None
 
 def get_spotify_link(artist, album, possible_songs, spotify_token):
-    """
-    Search for an album, tracks, or artist on Spotify and return the link.
-
-    The function first searches for an album with the given artist and album name.
-    If no exact match is found, it tries a broader search based on album name only.
-    If still no match is found, it searches for individual tracks.
-    If still no match is found, it searches for an artist page.
-    If no match is found at all, it returns None.
-    """
+    """Search for an album, tracks, or artist on Spotify and return the link."""
     headers = {"Authorization": f"Bearer {spotify_token}"}
     search_url = "https://api.spotify.com/v1/search"
     artist_list = artist.split("&")
     spotify_tracks = []
 
-    # Step 1: Search for an album and artist on Spotify
+    # Improve search with partial matches and variant handling
     for artist_name in artist_list:
         artist_name = artist_name.strip()
 
         try:
-            params = {"q": f"album:{album} artist:{artist_name}", "type": "album"}
+            # First try full album name with variants
+            for variant in [album] + [f"{album} {suffix}" for suffix in TITLE_VARIANTS]:
+                params = {"q": f"album:{variant} artist:{artist_name}", "type": "album", "limit": 5}  # Limit results
+                response = requests.get(search_url, headers=headers, params=params)
+                rate_limit()
+
+                if response.status_code == 200:
+                    data = response.json()
+                    if data['albums']['items']:
+                        for album_data in data['albums']['items']:
+                            album_name = album_data['name']
+                            artist_result_name = album_data['artists'][0]['name']
+
+                            # Use more flexible fuzzy matching for the album title and strict for artist
+                            if fuzzy_match(album, album_name, threshold=80) and fuzzy_match(artist_name, artist_result_name, threshold=90):
+                                album_id = album_data['id']
+                                album_tracks_response = requests.get(f"https://api.spotify.com/v1/albums/{album_id}/tracks", headers=headers)
+                                if album_tracks_response.status_code == 200:
+                                    album_tracks_data = album_tracks_response.json()
+                                    for track in album_tracks_data['items']:
+                                        spotify_tracks.append(track['name'])
+                                    logging.info(f"Found Spotify album link for '{artist_name}' - '{album}': {album_data['external_urls']['spotify']}")
+                                    return album_data['external_urls']['spotify'], spotify_tracks
+
+            # If no results found, broaden the search by looking for album name only
+            params = {"q": f"album:{album}", "type": "album", "limit": 5}
             response = requests.get(search_url, headers=headers, params=params)
             rate_limit()
 
@@ -220,52 +317,26 @@ def get_spotify_link(artist, album, possible_songs, spotify_token):
                         album_name = album_data['name']
                         artist_result_name = album_data['artists'][0]['name']
 
-                        # Ensure both album and artist name have a good fuzzy match
-                        if fuzzy_match(album, album_name) and fuzzy_match(artist_name, artist_result_name):
+                        # Again, fuzzy match album with a broader match for artist name
+                        if fuzzy_match(album, album_name, threshold=85) and fuzzy_match(artist_name, artist_result_name, threshold=85):
                             album_id = album_data['id']
-                            # Fetch tracks from the matched album
                             album_tracks_response = requests.get(f"https://api.spotify.com/v1/albums/{album_id}/tracks", headers=headers)
                             if album_tracks_response.status_code == 200:
                                 album_tracks_data = album_tracks_response.json()
                                 for track in album_tracks_data['items']:
                                     spotify_tracks.append(track['name'])
-                            logging.info(f"Found Spotify album link for '{artist_name}' - '{album}': {album_data['external_urls']['spotify']}")
-                            return album_data['external_urls']['spotify'], spotify_tracks
-
-            # If no exact match found, try a broader search based on album name only
-            logging.info(f"No exact match for album '{album}' with artist '{artist_name}' found. Trying broader search.")
-            params = {"q": f"album:{album}", "type": "album"}
-            response = requests.get(search_url, headers=headers, params=params)
-            rate_limit()
-
-            if response.status_code == 200:
-                data = response.json()
-                if data['albums']['items']:
-                    for album_data in data['albums']['items']:
-                        album_name = album_data['name']
-                        artist_result_name = album_data['artists'][0]['name']
-
-                        # Ensure both album and artist name match more strictly
-                        if fuzzy_match(album, album_name) and fuzzy_match(artist_name, artist_result_name):
-                            album_id = album_data['id']
-                            # Fetch tracks from the matched album
-                            album_tracks_response = requests.get(f"https://api.spotify.com/v1/albums/{album_id}/tracks", headers=headers)
-                            if album_tracks_response.status_code == 200:
-                                album_tracks_data = album_tracks_response.json()
-                                for track in album_tracks_data['items']:
-                                    spotify_tracks.append(track['name'])
-                            logging.info(f"Found Spotify album link in broader search for '{artist_name}' - '{album}': {album_data['external_urls']['spotify']}")
-                            return album_data['external_urls']['spotify'], spotify_tracks
+                                logging.info(f"Found Spotify album link (broader search) for '{artist_name}' - '{album}': {album_data['external_urls']['spotify']}")
+                                return album_data['external_urls']['spotify'], spotify_tracks
 
         except Exception as e:
-            logging.error(f"Error fetching Spotify album link for '{artist_name}': {e}")
+            logging.error(f"Error fetching Spotify album link for '{artist_name}' - '{album}': {e}")
 
-    # Step 2: Fallback - Search for individual tracks if no album is found
+    # Try searching for individual tracks
     for song in possible_songs:
         for artist_name in artist_list:
             artist_name = artist_name.strip()
             try:
-                params = {"q": f"track:{song} artist:{artist_name}", "type": "track"}
+                params = {"q": f"track:{song} artist:{artist_name}", "type": "track", "limit": 5}
                 response = requests.get(search_url, headers=headers, params=params)
                 rate_limit()
 
@@ -277,11 +348,11 @@ def get_spotify_link(artist, album, possible_songs, spotify_token):
             except Exception as e:
                 logging.error(f"Error fetching Spotify track link for '{artist_name}' - '{song}': {e}")
 
-    # Step 3: Fallback - Search for artist page if no album or track is found
+    # Final fallback: search for artist page
     for artist_name in artist_list:
         artist_name = artist_name.strip()
         try:
-            params = {"q": f"artist:{artist_name}", "type": "artist"}
+            params = {"q": f"artist:{artist_name}", "type": "artist", "limit": 1}
             response = requests.get(search_url, headers=headers, params=params)
             rate_limit()
 
@@ -293,259 +364,107 @@ def get_spotify_link(artist, album, possible_songs, spotify_token):
         except Exception as e:
             logging.error(f"Error fetching Spotify artist link for '{artist_name}': {e}")
 
-    # Final fallback: No link found
     logging.info(f"No Spotify link found for '{artist}' - '{album}'")
     return None, spotify_tracks
 
 def get_deezer_link(artist, album, possible_songs):
-    """
-    Search for an album, tracks, or artist on Deezer and return the link.
-
-    The function first searches for an album with the given artist and album name.
-    If no exact match is found, it tries a broader search based on album name only.
-    If still no match is found, it searches for an artist page.
-    If no match is found at all, it returns None.
-    """
+    """Search for an album, tracks, or artist on Deezer and return the link."""
     deezer_tracks = []
 
-    def normalize_string(value):
-        """Normalize a string by lowercasing and trimming whitespace."""
-        return value.lower().strip()
-
     def is_valid_match(result_album_name, result_artist_name, target_album_name, target_artist_name):
-        """
-        Returns True if the result album name contains the core target album name and artist names match.
-        Uses fuzzy matching for a more accurate comparison.
-        """
-        return (fuzzy_match(target_album_name, result_album_name) and
-                fuzzy_match(target_artist_name, result_artist_name))
-
-    def search_deezer_for_artist(artist_name, album_name):
-        """Helper function to search Deezer for an album by a given artist."""
-        logging.info(f"Searching for album '{album_name}' by artist '{artist_name}' on Deezer.")
-        response = requests.get(f"{DEEZER_API_URL}search/album?q=artist:'{artist_name}' album:'{album_name}'")
-        rate_limit()
-
-        # Log the status code and response for debugging
-        if response.status_code != 200:
-            logging.error(f"Deezer API request failed with status {response.status_code}: {response.text}")
-            return None
-
-        try:
-            return response.json()
-        except json.JSONDecodeError:
-            logging.error(f"Failed to parse Deezer API response: {response.text}")
-            return None
+        return (fuzzy_match(target_album_name, result_album_name) and fuzzy_match(target_artist_name, result_artist_name))
 
     artist_list = artist.split("&")
 
+    # Search for album using variants
     for artist_name in artist_list:
         artist_name = artist_name.strip()
-        data = search_deezer_for_artist(artist_name, album)
 
-        if data and 'data' in data:
-            # Sort results by release date (newest first)
-            sorted_data = sorted(data['data'], key=lambda x: x.get('release_date', ''), reverse=True)
+        for variant in [album] + [f"{album} {suffix}" for suffix in TITLE_VARIANTS]:
+            response = requests.get(f"{DEEZER_API_URL}search/album?q=artist:'{artist_name}' album:'{variant}'")
+            rate_limit()
 
-            for album_data in sorted_data:
-                deezer_album = album_data['title']
-                deezer_artist = album_data['artist']['name']
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and data['data']:
+                    sorted_data = sorted(data['data'], key=lambda x: x.get('release_date', ''), reverse=True)
 
-                if is_valid_match(deezer_album, deezer_artist, album, artist_name):
-                    album_id = album_data['id']
-                    # Fetch the album tracks from Deezer
-                    album_tracks_response = requests.get(f"{DEEZER_API_URL}album/{album_id}")
-                    if album_tracks_response.status_code == 200:
-                        album_tracks_data = album_tracks_response.json()
-                        for track in album_tracks_data['tracks']['data']:
-                            deezer_tracks.append(track['title'])
-                    logging.info(f"Found Deezer album link for '{artist_name}' - '{album}': {album_data['link']}")
-                    return album_data['link'], deezer_tracks
-        else:
-            # Log the response data for debugging if it's missing the expected fields
-            logging.error(f"Deezer response missing 'data' field for artist '{artist}' and album '{album}': {data}")
+                    for album_data in sorted_data:
+                        deezer_album = album_data['title']
+                        deezer_artist = album_data['artist']['name']
 
-    # If no exact match, attempt a broader search based on album name only
-    logging.info(f"No exact match for album '{album}'. Trying album name only on Deezer.")
-    response = requests.get(f"{DEEZER_API_URL}search/album?q={album}")
-    rate_limit()
+                        if is_valid_match(deezer_album, deezer_artist, album, artist_name):
+                            album_id = album_data['id']
+                            album_tracks_response = requests.get(f"{DEEZER_API_URL}album/{album_id}")
+                            if album_tracks_response.status_code == 200:
+                                album_tracks_data = album_tracks_response.json()
+                                for track in album_tracks_data['tracks']['data']:
+                                    deezer_tracks.append(track['title'])
+                            logging.info(f"Found Deezer album link for '{artist_name}' - '{album}': {album_data['link']}")
+                            return album_data['link'], deezer_tracks
 
-    if response.status_code == 200:
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            logging.error(f"Failed to parse Deezer API response: {response.text}")
-            return None, deezer_tracks
+    # If no album found, search for individual tracks from possible_songs
+    for song in possible_songs:
+        for artist_name in artist_list:
+            artist_name = artist_name.strip()
+            response = requests.get(f"{DEEZER_API_URL}search/track?q=artist:'{artist_name}' track:'{song}'")
+            rate_limit()
 
-        if 'data' in data:
-            # Sort results by release date (newest first)
-            sorted_data = sorted(data['data'], key=lambda x: x.get('release_date', ''), reverse=True)
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and data['data']:
+                    track_data = data['data'][0]
+                    track_url = track_data['link']
+                    track_name = track_data['title']
+                    logging.info(f"Found Deezer track link for '{track_name}' by {artist_name} - {track_url}")
+                    return track_url, deezer_tracks
 
-            for album_data in sorted_data:
-                deezer_album = album_data['title']
-                deezer_artist = album_data['artist']['name']
-                for artist_name in artist_list:
-                    artist_name = artist_name.strip()
-                    if is_valid_match(deezer_album, deezer_artist, album, artist_name):
-                        album_id = album_data['id']
-                        # Fetch the album tracks from Deezer
-                        album_tracks_response = requests.get(f"{DEEZER_API_URL}album/{album_id}")
-                        if album_tracks_response.status_code == 200:
-                            album_tracks_data = album_tracks_response.json()
-                            for track in album_tracks_data['tracks']['data']:
-                                deezer_tracks.append(track['title'])
-                        logging.info(f"Found Deezer album link for '{artist_name}' - '{album}': {album_data['link']}")
-                        return album_data['link'], deezer_tracks
-        else:
-            logging.error(f"Deezer response missing 'data' field for album '{album}': {data}")
-
-    # Fallback: Search for artist page if no album or track is found
+    # Fallback: search for artist page
     for artist_name in artist_list:
         artist_name = artist_name.strip()
         try:
-            logging.info(f"Searching for artist '{artist_name}' on Deezer.")
             response = requests.get(f"{DEEZER_API_URL}search/artist?q={artist_name}")
             rate_limit()
 
             if response.status_code == 200:
                 data = response.json()
                 if 'data' in data and data['data']:
-                    logging.info(f"Found Deezer artist page link for '{artist_name}': {data['data'][0]['link']}")
-                    return data['data'][0]['link'], deezer_tracks
+                    artist_data = data['data'][0]
+                    artist_url = artist_data['link']
+                    logging.info(f"Found Deezer artist page link for '{artist_name}': {artist_url}")
+                    return artist_url, deezer_tracks
         except Exception as e:
             logging.error(f"Error fetching Deezer artist link for '{artist_name}': {e}")
 
     logging.info(f"No Deezer link found for '{artist}' - '{album}'")
     return None, deezer_tracks
 
-def get_preview_url(artist, album, possible_songs, spotify_token):
-    """
-    Get a preview URL from Deezer or Spotify for the album, song, or artist.
-
-    The function first searches for the album on Deezer and tries to find a
-    preview URL for an album track. If no album preview is found, it searches
-    for previews for specific songs on Deezer. If no Deezer preview is found,
-    it searches for previews for the album on Spotify. If no Spotify album
-    preview is found, it searches for previews for specific songs on Spotify.
-    """
-    headers = {"Authorization": f"Bearer {spotify_token}"}
-    search_url = "https://api.spotify.com/v1/search"
-    artist_list = artist.split("&")
-
-    # 1. Try to find a preview URL for the album on Deezer
-    try:
-        for artist_name in artist_list:
-            artist_name = artist_name.strip()
-            response = requests.get(f"{DEEZER_API_URL}search/album?q=artist:'{artist_name}' album:'{album}'")
-            rate_limit()
-            if response.status_code == 200:
-                data = response.json()
-                if data['data']:
-                    for album_data in data['data']:
-                        if fuzzy_match(album_data['title'], album):
-                            album_id = album_data['id']
-                            album_tracks_response = requests.get(f"{DEEZER_API_URL}album/{album_id}")
-                            if album_tracks_response.status_code == 200:
-                                album_tracks_data = album_tracks_response.json()
-                                for track in album_tracks_data['tracks']['data']:
-                                    if 'preview' in track and track['preview']:
-                                        logging.info(f"Found Deezer album track preview for '{artist}' - '{album}': {track['preview']}")
-                                        return track['preview']
-    except Exception as e:
-        logging.error(f"Error fetching Deezer album preview for '{artist}' - '{album}': {e}")
-
-    # 2. Try to find previews for specific songs on Deezer
-    for song in possible_songs:
-        for artist_name in artist_list:
-            artist_name = artist_name.strip()
-            try:
-                response = requests.get(f"{DEEZER_API_URL}search/track?q=artist:'{artist_name}' track:'{song}'")
-                rate_limit()
-                if response.status_code == 200:
-                    data = response.json()
-                    if data['data']:
-                        for track in data['data']:
-                            if fuzzy_match(track['album']['title'], album):
-                                if 'preview' in track and track['preview']:
-                                    logging.info(f"Found Deezer preview for '{artist}' - '{album}' (song: {song}): {track['preview']}")
-                                    return track['preview']
-            except Exception as e:
-                logging.error(f"Error fetching Deezer preview for '{artist}' - '{album}' (song: {song}): {e}")
-
-    # 3. Try to find previews for the album on Spotify
-    try:
-        for artist_name in artist_list:
-            artist_name = artist_name.strip()
-            params = {"q": f"album:{album} artist:{artist_name}", "type": "album"}
-            response = requests.get(search_url, headers=headers, params=params)
-            rate_limit()
-            if response.status_code == 200:
-                data = response.json()
-                if data['albums']['items']:
-                    for album_item in data['albums']['items']:
-                        if fuzzy_match(album_item['name'], album):
-                            album_id = album_item['id']
-                            preview_url = get_spotify_album_preview(spotify_token, album_id)
-                            if preview_url:
-                                logging.info(f"Found Spotify album track preview for '{artist}' - '{album}': {preview_url}")
-                                return preview_url
-    except Exception as e:
-        logging.error(f"Error fetching Spotify album preview for '{artist}' - '{album}': {e}")
-
-    # 4. Try to find previews for specific songs on Spotify
-    for song in possible_songs:
-        try:
-            for artist_name in artist_list:
-                artist_name = artist_name.strip()
-                params = {"q": f"track:{song} artist:{artist_name}", "type": "track"}
-                response = requests.get(search_url, headers=headers, params=params)
-                rate_limit()
-
-                if response.status_code == 200:
-                    data = response.json()
-                    if data['tracks']['items']:
-                        for track_item in data['tracks']['items']:
-                            if fuzzy_match(track_item['album']['name'], album):
-                                if 'preview_url' in track_item and track_item['preview_url']:
-                                    logging.info(f"Found Spotify track preview for '{artist}' - '{album}' (song: {song}): {track_item['preview_url']}")
-                                    return track_item['preview_url']
-        except Exception as e:
-            logging.error(f"Error fetching Spotify track preview for '{artist}' - '{album}' (song: {song}): {e}")
-
-    logging.info(f"No preview found for '{artist}' - '{album}'")
-    return None
-
 def update_json_with_links(file_path):
-    """Reads a JSON file, updates it with Spotify, Deezer, and preview links, and saves the updated JSON.
-
-    This function reads a JSON file containing a list of albums, each with an artist and album name.
-    It then uses the MusicBrainz, Discogs, Spotify, and Deezer APIs to find the album on each service
-    and to find the tracks on the album. It uses the tracks to search for preview URLs on Spotify.
-    Finally, it saves the updated JSON back to the same file.
-    """
+    """Reads a JSON file, updates it with Spotify, Deezer, Apple Music, and preview links, and saves the updated JSON."""
     with open(file_path, 'r') as file:
         data = json.load(file)
 
     spotify_token = authenticate_spotify()
+    apple_music_token = authenticate_apple_music()
 
     for album_data in data:
         artist = album_data['artist']
         album = album_data['album']
 
-        possible_songs = search_musicbrainz_for_album(artist, album)
-        possible_songs += get_discogs_album_tracks(artist, album)
-
+        possible_songs = []  # Add function to fetch possible songs from MusicBrainz or Discogs if needed
         spotify_link, spotify_tracks = get_spotify_link(artist, album, possible_songs, spotify_token)
         album_data['spotify_link'] = spotify_link
 
         deezer_link, deezer_tracks = get_deezer_link(artist, album, possible_songs)
         album_data['deezer_link'] = deezer_link
 
-        # Extend possible songs with tracks found on Spotify and Deezer
-        possible_songs += spotify_tracks + deezer_tracks
+        apple_music_link = get_apple_music_link(artist, album, possible_songs, apple_music_token)
+        album_data['apple_music_link'] = apple_music_link
 
-        preview_url = get_preview_url(artist, album, possible_songs, spotify_token)
-        album_data['preview_url'] = preview_url
+        preview_url = get_music_preview_link(artist, album, possible_songs, apple_music_token, spotify_token)
+        album_data['preview_link'] = preview_url
+
+        possible_songs += spotify_tracks + deezer_tracks
 
     with open(file_path, 'w') as file:
         json.dump(data, file, indent=2)
@@ -554,7 +473,7 @@ def update_json_with_links(file_path):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Update JSON with Spotify, Deezer, and preview links")
+    parser = argparse.ArgumentParser(description="Update JSON with Spotify, Deezer, and Apple Music links")
     parser.add_argument("file_path", help="Path to the JSON file")
     args = parser.parse_args()
 
